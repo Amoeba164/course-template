@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 SWOT Analyzer CLI — для запуска в GitHub Actions
+С поддержкой нативного Anthropic Web Search
 """
 
 import os
@@ -15,11 +16,11 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
 import numpy as np
+import anthropic
 
 # LangChain
 from langchain_anthropic import ChatAnthropic
 from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
-from langchain_core.messages import HumanMessage, SystemMessage
 
 # Embeddings
 try:
@@ -322,7 +323,7 @@ def load_swot_from_db(swot_dict: dict) -> SWOTAnalysis:
 # =============================================================================
 
 def create_llm():
-    """Создать LLM клиент"""
+    """Создать LLM клиент для LangChain"""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY not set")
@@ -334,25 +335,19 @@ def create_llm():
     )
 
 
-def create_llm_with_search():
-    """Создать LLM с веб-поиском"""
+def create_search_client() -> anthropic.Anthropic:
+    """Создать клиент Anthropic для веб-поиска"""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY not set")
-    
-    return ChatAnthropic(
-        model=CLAUDE_MODEL,
-        max_tokens=4096,
-        anthropic_api_key=api_key
-    ).bind_tools([{
-        "type": "web_search_20250305",
-        "name": "web_search"
-    }])
+    return anthropic.Anthropic(api_key=api_key)
 
 
 def parse_json_response(text: str) -> dict:
-    """Парсинг JSON из ответа"""
+    """Парсинг JSON из ответа с улучшенной обработкой ошибок"""
     cleaned = text.strip()
+    
+    # Убираем markdown-обёртки
     if cleaned.startswith("```json"):
         cleaned = cleaned[7:]
     if cleaned.startswith("```"):
@@ -360,35 +355,76 @@ def parse_json_response(text: str) -> dict:
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3]
     
-    return json.loads(cleaned.strip())
+    cleaned = cleaned.strip()
+    
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        # Пробуем найти JSON в тексте
+        import re
+        json_match = re.search(r'\{[\s\S]*\}', cleaned)
+        if json_match:
+            try:
+                return json.loads(json_match.group())
+            except json.JSONDecodeError:
+                pass
+        
+        print(f"⚠️ Ошибка парсинга JSON: {e}")
+        print(f"   Текст: {cleaned[:200]}...")
+        raise
 
 
-def invoke_llm(llm, prompt_template: str, variables: dict) -> dict:
-    """Вызов LLM"""
+def invoke_llm(llm, prompt_template: str, variables: dict, max_retries: int = 2) -> dict:
+    """Вызов LLM с ретраями"""
     prompt = ChatPromptTemplate.from_messages([
         SystemMessagePromptTemplate.from_template(SYSTEM_MESSAGE),
         HumanMessagePromptTemplate.from_template(prompt_template)
     ])
     
     chain = prompt | llm
-    response = chain.invoke(variables)
-    content = response.content if hasattr(response, 'content') else str(response)
     
-    return parse_json_response(content)
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            response = chain.invoke(variables)
+            content = response.content if hasattr(response, 'content') else str(response)
+            return parse_json_response(content)
+        except json.JSONDecodeError as e:
+            last_error = e
+            if attempt < max_retries:
+                print(f"   🔄 Retry {attempt + 1}/{max_retries}...")
+            continue
+    
+    raise last_error
 
 
-def invoke_search(llm_search, query: str) -> str:
-    """Веб-поиск"""
-    response = llm_search.invoke(f"Найди актуальную информацию: {query}")
-    
-    if hasattr(response, 'content'):
-        if isinstance(response.content, list):
-            return " ".join([
-                block.get('text', '') if isinstance(block, dict) else str(block)
-                for block in response.content
-            ])
-        return response.content
-    return str(response)
+def invoke_search(client: anthropic.Anthropic, query: str) -> str:
+    """Веб-поиск через нативный Anthropic API"""
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=4096,
+            tools=[{
+                "type": "web_search_20250305",
+                "name": "web_search"
+            }],
+            messages=[{
+                "role": "user", 
+                "content": f"Найди актуальную информацию по запросу и кратко изложи ключевые факты: {query}"
+            }]
+        )
+        
+        # Собираем текст из всех блоков
+        result_parts = []
+        for block in response.content:
+            if hasattr(block, 'text'):
+                result_parts.append(block.text)
+        
+        return "\n".join(result_parts) if result_parts else "Результаты не найдены"
+        
+    except anthropic.APIError as e:
+        print(f"   ⚠️ Ошибка поиска: {e}")
+        return f"Ошибка поиска: {str(e)}"
 
 
 # =============================================================================
@@ -398,6 +434,7 @@ def invoke_search(llm_search, query: str) -> str:
 def get_embedding_model():
     """Загрузить модель эмбеддингов"""
     if not EMBEDDINGS_AVAILABLE:
+        print("⚠️ sentence-transformers не установлен, сравнение будет без эмбеддингов")
         return None
     return SentenceTransformer(EMBEDDING_MODEL_NAME)
 
@@ -449,7 +486,7 @@ def run_analysis(source_file: Path, context_file: Path, db_path: Path, outputs_d
     # Инициализация
     conn = init_db(db_path)
     llm = create_llm()
-    llm_search = create_llm_with_search()
+    search_client = create_search_client()
     
     # Получаем предыдущий SWOT
     prev_dict = get_latest_swot(conn)
@@ -470,7 +507,7 @@ def run_analysis(source_file: Path, context_file: Path, db_path: Path, outputs_d
     search_results = []
     for q in queries[:3]:
         print(f"   🔎 {q}")
-        result = invoke_search(llm_search, q)
+        result = invoke_search(search_client, q)
         search_results.append(f"Запрос: {q}\nРезультат: {result}\n")
     
     print("📊 Генерация O и T...")
@@ -835,6 +872,8 @@ def main():
         
     except Exception as e:
         print(f"❌ Ошибка: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
